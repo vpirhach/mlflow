@@ -208,3 +208,19 @@ def test_filter_list_gateway_endpoints_drops_unreadable(monkeypatch):
     a.filter_list_gateway_endpoints(resp)
     ids = [e["endpoint_id"] for e in json.loads(resp.data)["endpoints"]]
     assert ids == ["ep-allowed"]
+
+
+def test_metric_history_bulk_interval_rest_prefix_is_gated():
+    # The /api/2.0 twin was ungated when only the /ajax-api path had a validator.
+    req = _Req("/api/2.0/mlflow/metrics/get-history-bulk-interval", "GET")
+    assert a._find_validator(req) is not None
+
+
+def test_demo_routes_gating():
+    # generate is authenticated-open; delete hard-deletes the shared demo -> admin-only.
+    gen = a._find_validator(_Req("/ajax-api/3.0/mlflow/demo/generate", "POST"))
+    dele = a._find_validator(_Req("/ajax-api/3.0/mlflow/demo/delete", "POST"))
+    assert gen is not None
+    assert gen.__name__ == "_allow_authenticated"
+    assert dele is not None
+    assert dele.__name__ == "sender_is_admin"
