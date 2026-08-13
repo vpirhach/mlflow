@@ -118,6 +118,7 @@ from mlflow.protos.review_queues_pb2 import (
 )
 from mlflow.protos.service_pb2 import (
     AddDatasetToExperiments,
+    AddGuardrailToEndpoint,
     AttachModelToGatewayEndpoint,
     BatchGetTraceInfos,
     BatchGetTraces,
@@ -129,6 +130,7 @@ from mlflow.protos.service_pb2 import (
     CreateGatewayBudgetPolicy,
     CreateGatewayEndpoint,
     CreateGatewayEndpointBinding,
+    CreateGatewayGuardrail,
     CreateGatewayModelDefinition,
     CreateGatewaySecret,
     CreateLoggedModel,
@@ -146,6 +148,7 @@ from mlflow.protos.service_pb2 import (
     DeleteGatewayEndpoint,
     DeleteGatewayEndpointBinding,
     DeleteGatewayEndpointTag,
+    DeleteGatewayGuardrail,
     DeleteGatewayModelDefinition,
     DeleteGatewaySecret,
     DeleteLoggedModel,
@@ -169,6 +172,7 @@ from mlflow.protos.service_pb2 import (
     GetExperiment,
     GetExperimentByName,
     GetGatewayEndpoint,
+    GetGatewayGuardrail,
     GetGatewayModelDefinition,
     GetGatewaySecretInfo,
     GetLoggedModel,
@@ -183,7 +187,9 @@ from mlflow.protos.service_pb2 import (
     LinkPromptsToTrace,
     LinkTracesToRun,
     ListArtifacts,
+    ListEndpointGuardrailConfigs,
     ListGatewayEndpointBindings,
+    ListGatewayGuardrails,
     ListLoggedModelArtifacts,
     ListScorers,
     ListScorerVersions,
@@ -198,6 +204,7 @@ from mlflow.protos.service_pb2 import (
     QueryTraceMetrics,
     RegisterScorer,
     RemoveDatasetFromExperiments,
+    RemoveGuardrailFromEndpoint,
     RestoreExperiment,
     RestoreRun,
     SearchEvaluationDatasets,
@@ -216,6 +223,7 @@ from mlflow.protos.service_pb2 import (
     StartTrace,
     StartTraceV3,
     UpdateAssessment,
+    UpdateEndpointGuardrailConfig,
     UpdateExperiment,
     UpdateGatewayBudgetPolicy,
     UpdateGatewayEndpoint,
@@ -230,6 +238,9 @@ from mlflow.protos.service_pb2 import (
 )
 from mlflow.protos.service_pb2 import (
     ListGatewayBudgetPolicies as ListGatewayBudgetPolicies,
+)
+from mlflow.protos.service_pb2 import (
+    ListGatewayBudgetWindows as ListGatewayBudgetWindows,
 )
 from mlflow.protos.service_pb2 import (
     ListGatewayEndpoints as ListGatewayEndpoints,
@@ -1399,6 +1410,11 @@ def sender_is_admin():
     """Validate if the sender is admin"""
     username = authenticate_request().username
     return store.get_user(username).is_admin
+
+
+def _allow_authenticated():
+    # For routes open to any logged-in user (no tenant-scoped data): discovery, demo.
+    return True
 
 
 def validate_is_job_owner():
@@ -2712,10 +2728,22 @@ BEFORE_REQUEST_HANDLERS = {
     GetGatewayModelDefinition: validate_can_read_gateway_model_definition,
     UpdateGatewayModelDefinition: validate_can_update_gateway_model_definition,
     DeleteGatewayModelDefinition: validate_can_delete_gateway_model_definition,
-    # Routes for gateway budget policies
+    # Routes for gateway budget policies (admin-only, matching the write ops)
     CreateGatewayBudgetPolicy: sender_is_admin,
     UpdateGatewayBudgetPolicy: sender_is_admin,
     DeleteGatewayBudgetPolicy: sender_is_admin,
+    GetGatewayBudgetPolicy: sender_is_admin,
+    ListGatewayBudgetPolicies: sender_is_admin,
+    ListGatewayBudgetWindows: sender_is_admin,
+    # Standalone guardrail CRUD is admin-only; endpoint-attached routes gate on the endpoint.
+    CreateGatewayGuardrail: sender_is_admin,
+    GetGatewayGuardrail: sender_is_admin,
+    ListGatewayGuardrails: sender_is_admin,
+    DeleteGatewayGuardrail: sender_is_admin,
+    AddGuardrailToEndpoint: validate_can_update_gateway_endpoint,
+    RemoveGuardrailFromEndpoint: validate_can_update_gateway_endpoint,
+    UpdateEndpointGuardrailConfig: validate_can_update_gateway_endpoint,
+    ListEndpointGuardrailConfigs: validate_can_read_gateway_endpoint,
     # Routes for gateway endpoint-model mappings
     AttachModelToGatewayEndpoint: validate_can_update_gateway_endpoint,
     DetachModelFromGatewayEndpoint: validate_can_update_gateway_endpoint,
@@ -2898,6 +2926,11 @@ BEFORE_REQUEST_VALIDATORS.update({
     (GATEWAY_PROXY, "GET"): validate_gateway_proxy,
     (GATEWAY_PROXY, "POST"): validate_gateway_proxy,
     (INVOKE_SCORER, "POST"): validate_gateway_proxy,
+    # Discovery = authenticated (static lists); provider/secret config = admin-only.
+    (GATEWAY_SUPPORTED_PROVIDERS, "GET"): _allow_authenticated,
+    (GATEWAY_SUPPORTED_MODELS, "GET"): _allow_authenticated,
+    (GATEWAY_PROVIDER_CONFIG, "GET"): sender_is_admin,
+    (GATEWAY_SECRETS_CONFIG, "GET"): sender_is_admin,
     # Online scoring configuration (excluded from the auto generated map above).
     (ONLINE_SCORING_CONFIGS, "GET"): validate_can_read_online_scoring_configs,
     (AJAX_ONLINE_SCORING_CONFIGS, "GET"): validate_can_read_online_scoring_configs,
@@ -3368,14 +3401,6 @@ _HANDLER_INTERNAL_AUTHZ_SUFFIXES = (
 # (removed one at a time; when empty the flag can be flipped on).
 _KNOWN_UNGATED_ROUTE_MARKERS = (
     "/mlflow/issues/invoke",
-    "/gateway/budgets/",
-    "/gateway/guardrails/",
-    "/gateway/provider-config",
-    "/gateway/secrets/",
-    "/gateway/supported-providers",
-    "/gateway/supported-models",
-    "/gateway/endpoints/list",
-    "/gateway/model-definitions/list",
     "/mlflow/artifacts/presigned-upload-url",
     "/mlflow/demo/",
     "/mlflow/genai/evaluate/invoke",
@@ -4140,6 +4165,47 @@ def filter_list_scorers(resp: Response) -> None:
     resp.data = message_to_json(response_message)
 
 
+def filter_list_gateway_endpoints(resp: Response) -> None:
+    """Filter ``ListGatewayEndpoints`` responses to endpoints the caller can read."""
+    if sender_is_admin():
+        return
+    response_message = ListGatewayEndpoints.Response()
+    parse_dict(resp.json, response_message)
+    can_read = _role_based_read_predicate(authenticate_request().username, "gateway_endpoint")
+    for row in list(response_message.endpoints):
+        if not can_read(row.endpoint_id):
+            response_message.endpoints.remove(row)
+    resp.data = message_to_json(response_message)
+
+
+def filter_list_gateway_model_definitions(resp: Response) -> None:
+    """Filter ``ListGatewayModelDefinitions`` responses to rows the caller can read."""
+    if sender_is_admin():
+        return
+    response_message = ListGatewayModelDefinitions.Response()
+    parse_dict(resp.json, response_message)
+    can_read = _role_based_read_predicate(
+        authenticate_request().username, "gateway_model_definition"
+    )
+    for row in list(response_message.model_definitions):
+        if not can_read(row.model_definition_id):
+            response_message.model_definitions.remove(row)
+    resp.data = message_to_json(response_message)
+
+
+def filter_list_gateway_secrets(resp: Response) -> None:
+    """Filter ``ListGatewaySecretInfos`` responses to secrets the caller can read."""
+    if sender_is_admin():
+        return
+    response_message = ListGatewaySecretInfos.Response()
+    parse_dict(resp.json, response_message)
+    can_read = _role_based_read_predicate(authenticate_request().username, "gateway_secret")
+    for row in list(response_message.secrets):
+        if not can_read(row.secret_id):
+            response_message.secrets.remove(row)
+    resp.data = message_to_json(response_message)
+
+
 AFTER_REQUEST_PATH_HANDLERS = {
     CreateExperiment: set_can_manage_experiment_permission,
     CreateRegisteredModel: set_can_manage_registered_model_permission,
@@ -4159,6 +4225,10 @@ AFTER_REQUEST_PATH_HANDLERS = {
     DeleteGatewayEndpoint: delete_gateway_endpoint_permissions_cascade,
     CreateGatewayModelDefinition: set_can_manage_gateway_model_definition_permission,
     DeleteGatewayModelDefinition: delete_gateway_model_definition_permissions_cascade,
+    # Cross-resource gateway list endpoints: filter rows to what the caller can read.
+    ListGatewayEndpoints: filter_list_gateway_endpoints,
+    ListGatewayModelDefinitions: filter_list_gateway_model_definitions,
+    ListGatewaySecretInfos: filter_list_gateway_secrets,
     ListWorkspaces: filter_list_workspaces,
     CreateWorkspace: _seed_default_workspace_roles,
     DeleteWorkspace: _cleanup_workspace_permissions,
